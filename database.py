@@ -8,11 +8,13 @@ def create_connection():
     conn = None
     try:
         conn = sqlite3.connect(DATABASE_NAME)
+        # Enable foreign key constraint enforcement
+        conn.execute("PRAGMA foreign_keys = ON;")
     except sqlite3.Error as e:
         print(e)
     return conn
 
-def create_table():
+def create_inventory_table():
     """Creates the inventory table if it doesn't exist."""
     conn = create_connection()
     if conn is not None:
@@ -30,14 +32,44 @@ def create_table():
             """)
             conn.commit()
         except sqlite3.Error as e:
-            print(e)
+            print(f"Error creating inventory table: {e}")
         finally:
             conn.close()
     else:
-        print("Error! cannot create the database connection.")
+        print("Error! Cannot create the database connection for inventory table.")
 
-# Call create_table() once when the module is imported to ensure the table exists.
-create_table()
+def create_product_outflows_table():
+    """Creates the product_outflows table if it doesn't exist."""
+    conn = create_connection()
+    if conn is not None:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS product_outflows (
+                    outflow_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    quantity_dispatched INTEGER NOT NULL,
+                    department_name TEXT NOT NULL,
+                    date_dispatched TEXT NOT NULL,
+                    notes TEXT,
+                    FOREIGN KEY (item_id) REFERENCES inventory (id) ON DELETE CASCADE
+                )
+            """)
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error creating product_outflows table: {e}")
+        finally:
+            conn.close()
+    else:
+        print("Error! Cannot create the database connection for product_outflows table.")
+
+def initialize_database_tables():
+    """Initializes all necessary tables in the database."""
+    create_inventory_table()
+    create_product_outflows_table()
+
+# Call initialize_database_tables() once when the module is imported.
+initialize_database_tables()
 
 def add_item(name, quantity, description):
     """Adds a new item to the inventory."""
@@ -51,7 +83,7 @@ def add_item(name, quantity, description):
                 VALUES (?, ?, ?, ?, ?)
             """, (name, quantity, description, current_timestamp, current_timestamp))
             conn.commit()
-            return cursor.lastrowid # Return the id of the newly inserted item
+            return cursor.lastrowid 
         except sqlite3.Error as e:
             print(f"Error adding item: {e}")
             return None
@@ -61,6 +93,24 @@ def add_item(name, quantity, description):
         print("Error! cannot create the database connection.")
         return None
 
+def get_item_by_id(item_id):
+    """Retrieves a single item from the inventory by its ID."""
+    conn = create_connection()
+    if conn is None:
+        print("Error! Cannot create the database connection.")
+        return None
+    
+    item = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, quantity, description, date_added, last_modified FROM inventory WHERE id = ?", (item_id,))
+        item = cursor.fetchone() # Returns a tuple or None
+    except sqlite3.Error as e:
+        print(f"Error getting item by ID {item_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return item
 
 def get_all_items():
     """Retrieves all items from the inventory, ordered by id."""
@@ -93,7 +143,7 @@ def update_item(id, name, quantity, description):
                 WHERE id = ?
             """, (name, quantity, description, current_timestamp, id))
             conn.commit()
-            return cursor.rowcount > 0 # Return True if update was successful
+            return cursor.rowcount > 0 
         except sqlite3.Error as e:
             print(f"Error updating item {id}: {e}")
             return False
@@ -111,7 +161,7 @@ def delete_item(id):
             cursor = conn.cursor()
             cursor.execute("DELETE FROM inventory WHERE id = ?", (id,))
             conn.commit()
-            return cursor.rowcount > 0 # Return True if delete was successful
+            return cursor.rowcount > 0
         except sqlite3.Error as e:
             print(f"Error deleting item {id}: {e}")
             return False
@@ -127,7 +177,6 @@ def search_items(query):
     if conn is not None:
         try:
             cursor = conn.cursor()
-            # Using LOWER() for case-insensitive search
             cursor.execute("""
                 SELECT id, name, quantity, description, date_added, last_modified
                 FROM inventory
@@ -145,36 +194,168 @@ def search_items(query):
         print("Error! cannot create the database connection.")
         return []
 
+# --- Product Outflow Functions ---
+
+def add_product_outflow(item_id, quantity_dispatched, department_name, notes):
+    """
+    Adds a product outflow record and updates inventory quantity in a transaction.
+    Returns the outflow_id if successful, None otherwise.
+    """
+    conn = create_connection()
+    if conn is None:
+        print("Error! Cannot create the database connection for product outflow.")
+        return None
+
+    new_outflow_id = None
+    try:
+        conn.execute("BEGIN TRANSACTION;")
+        cursor = conn.cursor()
+
+        # Operation 1: Check and Update Inventory
+        # Using get_item_by_id to fetch current item details
+        item_row = get_item_by_id(item_id) # Note: This opens a new connection. For transactions, it's better to use the same cursor.
+                                           # However, get_item_by_id as a separate function will close its own connection.
+                                           # For robust transaction, the SELECT should use the 'cursor' from this function.
+        
+        # Re-fetching item data using the transaction's cursor for atomicity
+        cursor.execute("SELECT id, name, quantity, description, date_added, last_modified FROM inventory WHERE id = ?", (item_id,))
+        item_row_for_transaction = cursor.fetchone()
+
+
+        if item_row_for_transaction is None:
+            print(f"Error: Item with ID {item_id} not found in inventory.")
+            conn.execute("ROLLBACK;")
+            return None
+        
+        current_quantity = item_row_for_transaction[2] # quantity is at index 2
+        if current_quantity < quantity_dispatched:
+            print(f"Error: Insufficient stock for item ID {item_id}. Available: {current_quantity}, Required: {quantity_dispatched}")
+            conn.execute("ROLLBACK;")
+            return None
+
+        new_inventory_quantity = current_quantity - quantity_dispatched
+        current_timestamp_inventory = datetime.datetime.now().isoformat()
+        
+        cursor.execute("""
+            UPDATE inventory
+            SET quantity = ?, last_modified = ?
+            WHERE id = ?
+        """, (new_inventory_quantity, current_timestamp_inventory, item_id))
+
+        # Operation 2: Insert into product_outflows
+        date_dispatched_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO product_outflows (item_id, quantity_dispatched, department_name, date_dispatched, notes)
+            VALUES (?, ?, ?, ?, ?)
+        """, (item_id, quantity_dispatched, department_name, date_dispatched_str, notes))
+        
+        new_outflow_id = cursor.lastrowid
+        conn.execute("COMMIT;")
+
+    except sqlite3.Error as e:
+        print(f"Database error in add_product_outflow: {e}")
+        if conn:
+            conn.execute("ROLLBACK;")
+        new_outflow_id = None 
+    finally:
+        if conn:
+            conn.close()
+            
+    return new_outflow_id
+
+def get_outflows_for_item(item_id):
+    """Retrieves all outflow records for a specific item_id, ordered by date_dispatched descending."""
+    conn = create_connection()
+    if conn is None:
+        print("Error! Cannot create the database connection.")
+        return []
+    
+    items = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT outflow_id, item_id, quantity_dispatched, department_name, date_dispatched, notes 
+            FROM product_outflows 
+            WHERE item_id = ? 
+            ORDER BY date_dispatched DESC
+        """, (item_id,))
+        items = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Error getting outflows for item {item_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return items
+
+def get_outflows_by_department(department_name):
+    """Retrieves all outflow records for a specific department_name, ordered by date_dispatched descending."""
+    conn = create_connection()
+    if conn is None:
+        print("Error! Cannot create the database connection.")
+        return []
+        
+    items = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT outflow_id, item_id, quantity_dispatched, department_name, date_dispatched, notes 
+            FROM product_outflows 
+            WHERE department_name = ? 
+            ORDER BY date_dispatched DESC
+        """, (department_name,))
+        items = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Error getting outflows for department {department_name}: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return items
+
+def get_all_outflows():
+    """Retrieves all records from the product_outflows table, ordered by date_dispatched descending."""
+    conn = create_connection()
+    if conn is None:
+        print("Error! Cannot create the database connection.")
+        return []
+        
+    items = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT outflow_id, item_id, quantity_dispatched, department_name, date_dispatched, notes 
+            FROM product_outflows 
+            ORDER BY date_dispatched DESC
+        """)
+        items = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Error getting all outflows: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return items
+
 if __name__ == '__main__':
-    # Initialize the database and table when this script is run directly
-    # create_table() is called at module import level, no need to call it again here
-    print(f"Database '{DATABASE_NAME}' and table 'inventory' created/ensured.")
+    print(f"Database '{DATABASE_NAME}' and tables ('inventory', 'product_outflows') created/ensured.")
     
-    # Example usage (uncomment to test):
-    # print("Adding items...")
-    # item_id1 = add_item("Laptop", 10, "High-performance laptop")
-    # item_id2 = add_item("Mouse", 50, "Wireless optical mouse")
-    # item_id3 = add_item("Keyboard", 30, "Mechanical keyboard")
-    # print(f"Added items with IDs: {item_id1}, {item_id2}, {item_id3}")
+    # Example usage:
+    # item1 = add_item("Test Item A", 100, "Item A for testing outflows")
+    # item2 = add_item("Test Item B", 50, "Item B for testing outflows")
 
-    # print("\nAll items:")
-    # for item in get_all_items():
-    #     print(item)
-
-    # print("\nUpdating item with ID 1...")
-    # if item_id1:
-    #     update_item(item_id1, "Laptop Pro", 8, "Upgraded high-performance laptop")
-    #     print(get_all_items())
+    # if item1:
+    #    print(f"Item A (ID: {item1}) stock: {get_item_by_id(item1)[2]}")
+    #    outflow_a1 = add_product_outflow(item1, 10, "R&D", "Project X materials")
+    #    print(f"Outflow A1 ID: {outflow_a1}, Item A stock: {get_item_by_id(item1)[2]}")
+    #    outflow_a2 = add_product_outflow(item1, 200, "R&D", "This should fail - insufficient")
+    #    print(f"Outflow A2 ID: {outflow_a2}, Item A stock: {get_item_by_id(item1)[2]}")
     
-    # print("\nSearching for 'laptop':")
-    # for item in search_items("laptop"):
-    #     print(item)
+    # if item2:
+    #    print(f"Item B (ID: {item2}) stock: {get_item_by_id(item2)[2]}")
+    #    outflow_b1 = add_product_outflow(item2, 5, "Marketing", "Promo event")
+    #    print(f"Outflow B1 ID: {outflow_b1}, Item B stock: {get_item_by_id(item2)[2]}")
 
-    # print("\nDeleting item with ID 2...")
-    # if item_id2:
-    #     delete_item(item_id2)
-    #     print(get_all_items())
-    
-    # print("\nSearching for 'Key':") # Test case-insensitivity
-    # for item in search_items("Key"):
-    #     print(item)
+    # print("\nAll Outflows:")
+    # for r in get_all_outflows(): print(r)
+    # print("\nOutflows for Item A:")
+    # if item1: print(get_outflows_for_item(item1))
+    # print("\nOutflows for R&D:")
+    # print(get_outflows_by_department("R&D"))

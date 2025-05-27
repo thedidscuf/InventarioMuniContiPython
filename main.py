@@ -96,6 +96,52 @@ class Application(tk.Tk):
         self.clear_search_button = ttk.Button(search_frame, text="Limpiar Búsqueda", command=self.clear_search)
         self.clear_search_button.pack(side=tk.LEFT)
 
+        # --- Product Outflow Frame ---
+        outflow_main_frame = ttk.LabelFrame(self, text="Salida de Productos")
+        outflow_main_frame.pack(fill="x", padx=10, pady=10)
+
+        # Using a sub-frame for grid layout to ensure LabelFrame padding is respected
+        outflow_frame = ttk.Frame(outflow_main_frame)
+        outflow_frame.pack(padx=5, pady=5, fill="x")
+
+        # Row 0: Item selection
+        ttk.Label(outflow_frame, text="Artículo:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.outflow_item_map = {}
+        self.outflow_item_combobox = ttk.Combobox(outflow_frame, state="readonly", width=47) # width is char count
+        self.outflow_item_combobox.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        
+        self.refresh_outflow_items_button = ttk.Button(outflow_frame, text="Actualizar Lista de Artículos", command=self.load_items_to_outflow_combobox)
+        self.refresh_outflow_items_button.grid(row=0, column=2, padx=5, pady=5, sticky="e")
+
+        # Row 1: Quantity
+        ttk.Label(outflow_frame, text="Cantidad a Despachar:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.outflow_quantity_entry = ttk.Entry(outflow_frame, width=15)
+        self.outflow_quantity_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        # Row 2: Department
+        ttk.Label(outflow_frame, text="Departamento Destino:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.outflow_department_entry = ttk.Entry(outflow_frame, width=50)
+        self.outflow_department_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        
+        # Row 3: Notes
+        ttk.Label(outflow_frame, text="Notas:").grid(row=3, column=0, padx=5, pady=5, sticky="nw")
+        self.outflow_notes_text = tk.Text(outflow_frame, width=50, height=3)
+        self.outflow_notes_text.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+        
+        notes_scrollbar = ttk.Scrollbar(outflow_frame, orient=tk.VERTICAL, command=self.outflow_notes_text.yview)
+        self.outflow_notes_text.configure(yscrollcommand=notes_scrollbar.set)
+        notes_scrollbar.grid(row=3, column=2, padx=(0,5), pady=5, sticky="ns")
+
+        # Row 4: Register button
+        register_outflow_button = ttk.Button(outflow_frame, text="Registrar Salida", command=self.registrar_salida)
+        register_outflow_button.grid(row=4, column=0, columnspan=3, pady=10)
+
+        # Configure column weights for responsiveness in outflow_frame
+        outflow_frame.columnconfigure(1, weight=1)
+        
+        # Initial population of combobox
+        self.load_items_to_outflow_combobox()
+
 
     def on_item_select(self, event):
         selected_items = self.items_tree.selection()
@@ -285,6 +331,85 @@ class Application(tk.Tk):
         for item in items:
             self.items_tree.insert("", tk.END, values=item)
         self.clear_selection_and_disable_buttons() # Important to reset selection state
+
+    def load_items_to_outflow_combobox(self):
+        self.outflow_item_map.clear()
+        items = database.get_all_items()
+        display_items = []
+        if items:
+            for item in items:
+                # item: (id, name, quantity, description, date_added, last_modified)
+                item_id, item_name, item_quantity = item[0], item[1], item[2]
+                display_text = f"{item_name} (ID: {item_id}, Stock: {item_quantity})"
+                display_items.append(display_text)
+                self.outflow_item_map[display_text] = item_id
+            self.outflow_item_combobox['values'] = display_items
+            self.outflow_item_combobox.current(0) # Select the first item
+        else:
+            self.outflow_item_combobox['values'] = []
+            self.outflow_item_combobox.set('') # Clear current selection if no items
+
+    def registrar_salida(self):
+        selected_display_text = self.outflow_item_combobox.get()
+        if not selected_display_text:
+            messagebox.showerror("Error de Validación", "Por favor, seleccione un artículo.", parent=self)
+            return
+
+        item_id = self.outflow_item_map.get(selected_display_text)
+        if item_id is None: # Should not happen if combobox is populated correctly
+            messagebox.showerror("Error Interno", "Artículo seleccionado no válido. Por favor, actualice la lista de artículos.", parent=self)
+            return
+
+        quantity_str = self.outflow_quantity_entry.get().strip()
+        if not quantity_str:
+            messagebox.showerror("Error de Validación", "Por favor, ingrese la cantidad a despachar.", parent=self)
+            return
+
+        try:
+            quantity_dispatched = int(quantity_str)
+            if quantity_dispatched <= 0:
+                raise ValueError("Quantity must be positive")
+        except ValueError:
+            messagebox.showerror("Error de Validación", "La cantidad a despachar debe ser un número entero positivo.", parent=self)
+            return
+
+        department_name = self.outflow_department_entry.get().strip()
+        if not department_name:
+            messagebox.showerror("Error de Validación", "Por favor, ingrese el nombre del departamento.", parent=self)
+            return
+
+        notes = self.outflow_notes_text.get("1.0", tk.END).strip()
+
+        # Crucial: Fetch current stock again right before transaction
+        item_details = database.get_item_by_id(item_id)
+        if not item_details:
+            messagebox.showerror("Error de Base de Datos", f"No se pudo encontrar el artículo ID: {item_id} en la base de datos.", parent=self)
+            self.load_items_to_outflow_combobox() # Refresh combobox as item might be gone
+            return
+        
+        available_stock = item_details[2] # quantity is at index 2
+        if quantity_dispatched > available_stock:
+            messagebox.showerror("Error de Stock", f"La cantidad a despachar ({quantity_dispatched}) no puede exceder el stock disponible (Stock actual: {available_stock}).", parent=self)
+            return
+
+        # Proceed with outflow
+        outflow_id = database.add_product_outflow(item_id, quantity_dispatched, department_name, notes)
+
+        if outflow_id:
+            messagebox.showinfo("Éxito", f"Salida registrada exitosamente. ID de Salida: {outflow_id}.", parent=self)
+            # Clear fields
+            self.outflow_item_combobox.set('') # Clear selection, or set to first if desired
+            self.outflow_quantity_entry.delete(0, tk.END)
+            self.outflow_department_entry.delete(0, tk.END)
+            self.outflow_notes_text.delete("1.0", tk.END)
+            
+            # Refresh main inventory and combobox
+            self.load_inventory()
+            self.load_items_to_outflow_combobox()
+        else:
+            # The database function add_product_outflow already prints specific errors to console (e.g. "insufficient stock" if race condition happened)
+            messagebox.showerror("Error de Registro", "Error al registrar la salida. Verifique el stock o contacte al administrador.", parent=self)
+
 
 if __name__ == "__main__":
     app = Application()
